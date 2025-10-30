@@ -1,0 +1,4 @@
+name = "522cnm"
+main = "jiami2.js"
+compatibility_date = "2025-07-18"
+keep_vars = true

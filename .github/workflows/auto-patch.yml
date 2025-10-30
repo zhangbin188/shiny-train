@@ -1,0 +1,145 @@
+name: Auto Patch
+
+on:
+  workflow_run:
+    workflows:
+      - Upstream File Sync
+    types:
+      - completed
+  push:
+    paths:
+      - '_worker.js'
+      - 'worker.patch'
+  workflow_dispatch:
+
+jobs:
+  apply-patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+          ref: ${{ github.ref }}  # 使用当前分支引用而不是提交SHA
+
+      - name: Check if should run
+        id: check-run
+        run: |
+          # 手动触发时总是运行
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "::notice::手动触发工作流"
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # 检查变更文件列表
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+          echo "变更文件: $CHANGED_FILES"
+          
+          # 如果 _worker.js 或 worker.patch 有变更则运行
+          if [[ "$CHANGED_FILES" =~ "_worker.js" ]] || [[ "$CHANGED_FILES" =~ "worker.patch" ]]; then
+            echo "::notice::检测到 _worker.js 或 worker.patch 变更"
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "::notice::未检测到相关文件变更，跳过工作流"
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Node.js
+        if: ${{ steps.check-run.outputs.should_run == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        if: ${{ steps.check-run.outputs.should_run == 'true' }}
+        run: |
+          sudo apt-get install -y patch dos2unix
+
+      - name: Verify patch file
+        if: ${{ steps.check-run.outputs.should_run == 'true' }}
+        run: |
+          if [ ! -f "worker.patch" ]; then
+            echo "❌ 未找到补丁文件 worker.patch!"
+            exit 1
+          fi
+          echo "补丁文件内容预览:"
+          head -n 10 worker.patch
+
+      - name: Normalize line endings
+        if: ${{ steps.check-run.outputs.should_run == 'true' }}
+        run: |
+          dos2unix _worker.js worker.patch
+          cp _worker.js _worker.js.bak
+          cp worker.patch worker.patch.bak
+          echo "_worker.js 行尾格式:"
+          file _worker.js
+          echo "worker.patch 行尾格式:"
+          file worker.patch
+
+      - name: Apply patch to create _worker2.js
+        if: ${{ steps.check-run.outputs.should_run == 'true' }}
+        run: |
+          patch -l --binary -u _worker.js.bak -i worker.patch -o _worker2.js
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ 补丁应用失败"
+            echo "::warning::补丁应用失败, 检查补丁兼容性"
+            echo "尝试使用模糊匹配 (fuzz=3)..."
+            patch -l --binary -u -F 3 _worker.js.bak -i worker.patch -o _worker2.js
+            
+            if [ $? -ne 0 ]; then
+              echo "❌ 模糊匹配也失败"
+              exit 1
+            else
+              echo "✅ 使用模糊匹配成功"
+            fi
+          else
+            echo "✅ 补丁应用成功"
+          fi
+          
+          ls -la _worker*.js
+
+      - name: Clean up temporary files
+        if: ${{ steps.check-run.outputs.should_run == 'true' }}
+        run: |
+          rm -f _worker.js.bak
+          rm -f worker.patch.bak
+          rm -f *.rej
+          rm -f *.orig
+          git checkout -- _worker.js
+          git status
+
+      - name: Commit changes
+        if: ${{ steps.check-run.outputs.should_run == 'true' }}
+        run: |
+          # 获取当前分支名称
+          BRANCH_NAME=$(git symbolic-ref --short HEAD)
+          echo "当前分支: $BRANCH_NAME"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add _worker2.js
+          
+          if git diff-index --cached --quiet HEAD --; then
+            echo "ℹ️ 没有任何需要提交的更改"
+          else
+            git commit -m "Auto-patch _worker2.js"
+            # 先拉取远程变更，再强制推送
+            git pull --rebase origin $BRANCH_NAME
+            git push origin HEAD:$BRANCH_NAME
+          fi
+
+      - name: Create debug artifacts
+        if: ${{ failure() && steps.check-run.outputs.should_run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-debug-files
+          path: |
+            _worker.js
+            worker.patch
+            _worker2.js
+            *.rej
+          retention-days: 7
